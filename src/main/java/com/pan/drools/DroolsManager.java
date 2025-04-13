@@ -1,9 +1,7 @@
 package com.pan.drools;
 
-import com.pan.drools.pojo.Applicant;
 import org.drools.compiler.kie.builder.impl.InternalKieModule;
 import org.drools.compiler.kie.builder.impl.KieContainerImpl;
-import org.kie.api.KieBase;
 import org.kie.api.KieServices;
 import org.kie.api.builder.KieBuilder;
 import org.kie.api.builder.KieFileSystem;
@@ -11,7 +9,10 @@ import org.kie.api.builder.Message;
 import org.kie.api.builder.Results;
 import org.kie.api.builder.model.KieBaseModel;
 import org.kie.api.builder.model.KieModuleModel;
+import org.kie.api.command.BatchExecutionCommand;
+import org.kie.api.command.Command;
 import org.kie.api.conf.SessionsPoolOption;
+import org.kie.api.event.rule.AgendaEventListener;
 import org.kie.api.runtime.KieContainer;
 import org.kie.api.runtime.KieContainerSessionsPool;
 import org.kie.api.runtime.StatelessKieSession;
@@ -28,7 +29,7 @@ public class DroolsManager {
     private final static Logger logger = LoggerFactory.getLogger(DroolsManager.class);
 
     public static final String KMODULE_SRC_RESOURCES_PATH = "src/main/resources/";
-    public static final String DEFAULT_KIE_BASE_NAME = "default";
+    public static final String DEFAULT_KIE_BASE_NAME = "defaultKieBase";
     private static final int DEFAULT_POOL_SIZE = 10;
     private static final String KIE_BASE_SESSION = "-session";
 
@@ -93,24 +94,13 @@ public class DroolsManager {
     }
 
     public void deleteRules(Collection<DroolsRule> rules) {
-        for (DroolsRule rule : rules) {
-            if (existsKieBase(rule.getKieBaseName())) {
-                KieBase kieBase = this.kieContainer.getKieBase(rule.getKieBaseName());
-                // TODO ruleName
-                kieBase.removeRule(rule.getPackageName(), rule.getId());
-                if (logger.isInfoEnabled()) {
-                    logger.info("Deleted rule [{}] [{}]", rule.getId(), rule.getKieBaseName());
-                }
-            }
-        }
+        String[] drlPaths = rules.stream().map(this::buildDrlPath).distinct().toArray(String[]::new);
+        this.deleteDrlFile(drlPaths);
+        this.rebuildAllRules();
     }
 
     public void addOrUpdateRule(DroolsRule rule) {
         this.addOrUpdateRules(Collections.singletonList(rule));
-    }
-
-    public void addOrUpdateRules(DroolsRule... rules) {
-        this.addOrUpdateRules(Arrays.asList(rules));
     }
 
     public void addOrUpdateRules(Collection<DroolsRule> rules) {
@@ -123,11 +113,54 @@ public class DroolsManager {
             if (!packages.contains(rule.getPackageName())) {
                 kieBaseModel.addPackage(rule.getPackageName());
             }
-            this.writeDrl(rule);
+            kfs.write(this.buildDrlPath(rule), rule.getContent());
         }
+        this.rebuildAllRules();
+    }
+
+    public StatelessKieSession getStatelessKieSession(String kieBaseName) {
+        return this.getStatelessKieSession(kieBaseName, null);
+    }
+
+    /**
+     * 获取 StatelessKieSession
+     * @param kieBaseName kieBaseName
+     * @param listener 监听器
+     * @return StatelessKieSession
+     */
+    public StatelessKieSession getStatelessKieSession(String kieBaseName, AgendaEventListener listener) {
+        if (this.pool == null || !this.existsKieBase(kieBaseName)) {
+            return null;
+        }
+        StatelessKieSession kieSession = pool.newStatelessKieSession(getKieSessionName(kieBaseName));
+        Optional.ofNullable(kieSession).ifPresent(session -> {
+            if (listener != null) {
+                session.addEventListener(listener);
+            }
+        });
+        return kieSession;
+    }
+
+    public BatchExecutionCommand getBatchExecutionCommand(String agendaGroup, Object fact) {
+        List<Command<?>> commands = new ArrayList<>();
+        commands.add(kieServices.getCommands().newInsert(fact));
+        commands.add(kieServices.getCommands().newAgendaGroupSetFocus(agendaGroup));
+        commands.add(kieServices.getCommands().newFireAllRules());
+        return kieServices.getCommands().newBatchExecution(commands);
+    }
+
+    public void close() {
+        if (this.pool != null) {
+            this.pool.shutdown();
+        }
+    }
+
+    private void rebuildAllRules() {
+        long startTime = System.currentTimeMillis();
         KieBuilder kieBuilder = kieServices.newKieBuilder(kfs);
         kieBuilder.buildAll();
         Results results = kieBuilder.getResults();
+        // 检查是否有构建失败的规则，错误规则需要从 kfs 中删除
         List<Message> messages = results.getMessages(Message.Level.ERROR);
         if (messages != null && !messages.isEmpty()) {
             Set<String> errorDrlPath = new HashSet<>();
@@ -138,10 +171,15 @@ public class DroolsManager {
                 errorDrlPath.add(KMODULE_SRC_RESOURCES_PATH + message.getPath());
             }
             this.deleteDrlFile(errorDrlPath.toArray(new String[0]));
-        }
-        else {
+        } else {
             ((KieContainerImpl) kieContainer).updateToKieModule((InternalKieModule) kieBuilder.getKieModule());
         }
+        long endTime = System.currentTimeMillis();
+        logger.info("Rebuild all rules cost [{}] ms", endTime - startTime);
+    }
+
+    private void deleteDrlFile(Collection<String> drlPaths) {
+        this.deleteDrlFile(drlPaths.toArray(new String[0]));
     }
 
     private void deleteDrlFile(String... paths) {
@@ -151,14 +189,13 @@ public class DroolsManager {
         }
     }
 
-    private void writeDrl(DroolsRule rule) {
-        String filePath = KMODULE_SRC_RESOURCES_PATH + rule.getKieBaseName() + "/" + rule.getId() + ".drl";
-        kfs.write(filePath, rule.getContent());
+    private String buildDrlPath(DroolsRule rule) {
+        return KMODULE_SRC_RESOURCES_PATH + rule.getKieBaseName() + "/" + rule.getId() + ".drl";
     }
 
-    public boolean exec(String kieBaseName, Applicant applicant) {
-        StatelessKieSession kieSession = pool.newStatelessKieSession(kieBaseName + KIE_BASE_SESSION);
-        kieSession.execute(applicant);
-        return applicant.isValid();
+    private String getKieSessionName(String kieBaseName) {
+        return kieBaseName + KIE_BASE_SESSION;
     }
+
+
 }
